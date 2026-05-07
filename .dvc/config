@@ -1,0 +1,4 @@
+[core]
+    remote = myremote
+['remote "myremote"']
+    url = s3://mlops-track2-dev-model-store-52de15/dvc
