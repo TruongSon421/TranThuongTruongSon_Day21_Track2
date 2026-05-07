@@ -1,5 +1,27 @@
-# Sieu tham so cho mo hinh RandomForestClassifier
-# Thay doi cac gia tri nay giua cac lan chay de thi nghiem (Buoc 1)
-n_estimators: 100
-max_depth: 5
+# Chon model: random_forest | extra_trees | gradient_boosting | logistic_regression
+model_type: extra_trees
+
+# Sieu tham so cho extra_trees
+n_estimators: 500
+max_features: 1.0
+criterion: gini
+max_depth: null
+max_leaf_nodes: null
 min_samples_split: 2
+min_samples_leaf: 1
+min_impurity_decrease: 0.0
+ccp_alpha: 0.0
+bootstrap: false
+max_samples: null
+oob_score: false
+class_weight: balanced
+n_jobs: -1
+random_state: 42
+
+# Preprocessing
+preprocessing_clip_quantile: 0.02
+
+# Sieu tham so bo sung (chi dung voi model tuong ung)
+learning_rate: 0.1
+C: 1.0
+max_iter: 1000

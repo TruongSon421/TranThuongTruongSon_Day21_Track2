@@ -1,0 +1,6 @@
+aws_region        = "ap-southeast-1"
+project_name      = "mlops-track2"
+environment       = "dev"
+model_key         = "models/latest/model.pkl"
+ec2_instance_type = "t2.small"
+ec2_key_name      = "your-keypair-name"  # tên key pair đã tạo trên AWS

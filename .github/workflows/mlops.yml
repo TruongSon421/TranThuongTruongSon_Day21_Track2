@@ -2,7 +2,7 @@ name: MLOps Pipeline
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - 'data/**.dvc'
       - 'src/**.py'
@@ -32,7 +32,7 @@ jobs:
 
       - name: Run unit tests
         # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+        run: pytest tests/ -v
 
 
   # ---------------------------------------------------------------------------
@@ -57,6 +57,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Configure MLflow tracking (optional)
+        run: |
+          if [ -n "${{ secrets.MLFLOW_TRACKING_URI }}" ]; then
+            echo "MLFLOW_TRACKING_URI=${{ secrets.MLFLOW_TRACKING_URI }}" >> $GITHUB_ENV
+            echo "MLFLOW_TRACKING_USERNAME=${{ secrets.MLFLOW_TRACKING_USERNAME }}" >> $GITHUB_ENV
+            echo "MLFLOW_TRACKING_PASSWORD=${{ secrets.MLFLOW_TRACKING_PASSWORD }}" >> $GITHUB_ENV
+            echo "Using remote MLflow tracking server."
+          else
+            echo "Using local/default MLflow tracking."
+          fi
+
       - name: Authenticate to Cloud Storage
         # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
         # GCP:   echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
@@ -65,12 +76,16 @@ jobs:
         #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
         # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
         run: |
-          # <dien code o day>
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+          echo "S3_BUCKET=${{ secrets.S3_BUCKET }}" >> $GITHUB_ENV
+          echo "S3_MODEL_KEY=models/latest/model.pkl" >> $GITHUB_ENV
 
       - name: Pull data with DVC
         # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
         #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
-        run: # <dien lenh o day>
+        run: dvc pull data/train_phase1.csv.dvc data/eval.csv.dvc
 
       - name: Train model
         run: python src/train.py
@@ -84,7 +99,8 @@ jobs:
         #   ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
         #   echo "accuracy=$ACC" >> $GITHUB_OUTPUT
         run: |
-          # <dien code o day>
+          ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
+          echo "accuracy=$ACC" >> $GITHUB_OUTPUT
 
       - name: Upload model to Cloud Storage
         # TODO 5: Su dung cloud SDK de upload models/model.pkl len
@@ -92,14 +108,27 @@ jobs:
         #         Ten bucket lay tu secret CLOUD_BUCKET.
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          import os
+          import boto3
+
+          bucket_name = os.environ["S3_BUCKET"]
+          region = os.environ.get("AWS_REGION")
+          client = boto3.client("s3", region_name=region)
+
+          client.upload_file("models/model.pkl", bucket_name, "models/latest/model.pkl")
+          print(f"Uploaded to s3://{bucket_name}/models/latest/model.pkl")
+
+          client.upload_file("outputs/metrics.json", bucket_name, "models/latest/metrics.json")
+          print(f"Uploaded to s3://{bucket_name}/models/latest/metrics.json")
           EOF
 
-      - name: Save metrics as artifact
+      - name: Save training outputs as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
-          path: outputs/metrics.json
+          name: training_outputs
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
 
   # ---------------------------------------------------------------------------
@@ -113,6 +142,22 @@ jobs:
     needs: train
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Cloud Storage
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+          echo "S3_BUCKET=${{ secrets.S3_BUCKET }}" >> $GITHUB_ENV
+          echo "S3_MODEL_KEY=models/latest/model.pkl" >> $GITHUB_ENV
 
       - name: Check eval gate
         # TODO 6: Doc accuracy tu output cua job train.
@@ -126,13 +171,50 @@ jobs:
         #   print("PASSED: dang trien khai model.")
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          acc = float("${{ needs.train.outputs.accuracy }}")
+          if acc < 0.70:
+              raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
+          print(f"PASSED: accuracy {acc:.4f} >= 0.70. Dang trien khai model.")
+          EOF
+
+      - name: Compare with previous deployed metrics
+        run: |
+          python - <<'EOF'
+          import json
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          new_acc = float("${{ needs.train.outputs.accuracy }}")
+          bucket_name = os.environ["S3_BUCKET"]
+          region = os.environ.get("AWS_REGION")
+          client = boto3.client("s3", region_name=region)
+
+          try:
+              response = client.get_object(Bucket=bucket_name, Key="models/latest/metrics.json")
+          except ClientError as exc:
+              error_code = exc.response.get("Error", {}).get("Code", "")
+              if error_code in {"NoSuchKey", "404"}:
+                  print("No previous metrics found. Continue deploy.")
+                  raise SystemExit(0)
+              raise
+
+          old_metrics = json.loads(response["Body"].read().decode("utf-8"))
+          old_acc = float(old_metrics.get("accuracy", 0.0))
+
+          print(f"Previous accuracy: {old_acc:.4f}")
+          print(f"New accuracy: {new_acc:.4f}")
+          if new_acc < old_acc:
+              raise SystemExit(
+                  f"FAILED: new accuracy {new_acc:.4f} < previous {old_acc:.4f}. Huy deploy."
+              )
+          print("PASSED: new accuracy >= previous accuracy. Continue deploy.")
           EOF
 
 
   # ---------------------------------------------------------------------------
   # JOB 4 - DEPLOY
-  # Trien khai len VM qua SSH.
+  # Trien khai len EC2 qua SSH.
   # Chi chay khi Job 3 (Eval) hoan thanh thanh cong.
   # ---------------------------------------------------------------------------
   deploy:
@@ -141,12 +223,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: SSH deploy to VM
+      - name: SSH deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             # TODO 7: Restart service mlops-serve tren VM.
             # TODO 8: Cho server san sang roi goi curl /health de xac nhan.
@@ -156,4 +238,6 @@ jobs:
             #   sudo systemctl restart mlops-serve
             #   sleep 5
             #   curl -sf http://localhost:8000/health && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            sudo systemctl restart mlops-serve
+            sleep 5
+            curl -sf http://localhost:8000/health && echo "Health check passed." || exit 1
